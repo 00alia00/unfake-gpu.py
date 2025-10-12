@@ -72,7 +72,7 @@ pip install -e .
 
 ### Requirements
 
-- Python 3.8+  
+- Python 3.10+  
 - Rust toolchain (for building from source)  
 - OpenCV Python bindings  
 - Pillow  
@@ -203,6 +203,10 @@ asyncio.run(process_image_async())
 - Roughly O(num_kernels * num_pixels) => O(num_pixels) per iteration
 
 ---
+
+## Versions
+- **v1.0.7.1**: Merged changes from original v1.0.7
+- **v1.0.4.1**: Initial fork from original v1.0.4, added new options (`hybrid`, `--pre-filter`, `--edge-preserve`, `--iterations`, etc.)
 
 ## Credits
 

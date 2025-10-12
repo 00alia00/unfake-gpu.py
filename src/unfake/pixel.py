@@ -1,4 +1,3 @@
-# File: pixel.py
 #!/usr/bin/env python3
 """
 Forked from unfake.py by Benjamin Paine (github @painebenjamin)
@@ -38,6 +37,7 @@ try:
         downscale_dominant_color_accelerated,
         downscale_mode_accelerated,
         finalize_pixels_accelerated,
+        make_background_transparent_accelerated,
         map_pixels_to_palette_accelerated,
         runs_based_detect_accelerated,
     )
@@ -55,14 +55,14 @@ logger = logging.getLogger("unfake.py")
 class ProcessingManifest:
     """Stores metadata about the image processing pipeline"""
 
-    original_size: Tuple[int, int]
-    final_size: Tuple[int, int]
-    processing_steps: Dict
+    original_size: tuple[int, int]
+    final_size: tuple[int, int]
+    processing_steps: dict
     processing_time_ms: int
     timestamp: str
 
 
-def gcd_array(arr: List[int]) -> int:
+def gcd_array(arr: list[int]) -> int:
     """Calculate GCD of an array of numbers"""
     if not arr:
         return 1
@@ -84,7 +84,7 @@ def detect_scale_from_signal(signal: np.ndarray) -> int:
     threshold = mean_val + 1.5 * std_val
 
     # Find peaks
-    peaks: List[int] = []
+    peaks: list[int] = []
     for i in range(1, len(signal) - 1):
         if signal[i] > threshold and signal[i] > signal[i - 1] and signal[i] > signal[i + 1]:
             if not peaks or i - peaks[-1] > 2:
@@ -250,7 +250,7 @@ def get_gradient_profile(gray: np.ndarray, direction: str) -> np.ndarray:
     return profile  # type: ignore[no-any-return]
 
 
-def find_optimal_crop(gray: np.ndarray, scale: int) -> Tuple[int, int]:
+def find_optimal_crop(gray: np.ndarray, scale: int) -> tuple[int, int]:
     """Find optimal crop offset to align with pixel grid"""
     sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -347,6 +347,126 @@ def jaggy_cleaner(image: np.ndarray) -> np.ndarray:
 
     return result  # type: ignore[no-any-return]
 
+def make_background_transparent(
+    image: np.ndarray, tolerance: int = 1, mode: str = "edges"
+) -> np.ndarray:
+    """
+    Make background transparent by flood-filling from specified starting points
+
+    Args:
+        image: Input image (RGB or RGBA)
+        tolerance: Color similarity tolerance (0-255)
+        mode: Flood-fill starting mode - "edges" (all edge pixels), "corners" (four corners),
+              or "midpoints" (midpoint of each edge)
+
+    Returns:
+        Image with transparent background
+    """
+    # Use accelerated version if available
+    if "RUST_AVAILABLE" in globals() and RUST_AVAILABLE:
+        return make_background_transparent_accelerated(image, tolerance, mode)
+
+    # Fallback to Python implementation
+    # Ensure image has alpha channel
+    if image.shape[2] == 3:
+        # Add alpha channel
+        h, w = image.shape[:2]
+        alpha = np.ones((h, w, 1), dtype=np.uint8) * 255
+        result = np.concatenate([image, alpha], axis=2)
+    else:
+        result = image.copy()
+
+    h, w = result.shape[:2]
+    visited = np.zeros((h, w), dtype=bool)
+
+    def is_similar(color1: np.ndarray, color2: np.ndarray) -> bool:
+        """Check if two colors are similar within tolerance"""
+        return bool(np.all(np.abs(color1.astype(int) - color2.astype(int)) <= tolerance))
+
+    def flood_fill(start_y: int, start_x: int) -> None:
+        """Flood fill from a starting point to find contiguous color region"""
+        # Skip if already visited or transparent
+        if visited[start_y, start_x] or result[start_y, start_x, 3] < 128:
+            return
+
+        target_color = result[start_y, start_x, :3].copy()
+        stack = [(start_y, start_x)]
+
+        while stack:
+            y, x = stack.pop()
+
+            # Bounds check
+            if y < 0 or y >= h or x < 0 or x >= w:
+                continue
+
+            # Skip if already visited
+            if visited[y, x]:
+                continue
+
+            # Skip if already transparent
+            if result[y, x, 3] < 128:
+                visited[y, x] = True
+                continue
+
+            # Check if color matches
+            if not is_similar(result[y, x, :3], target_color):
+                continue
+
+            # Mark as visited and make transparent
+            visited[y, x] = True
+            result[y, x] = [0, 0, 0, 0]
+
+            # Add neighbors to stack
+            stack.append((y - 1, x))  # up
+            stack.append((y + 1, x))  # down
+            stack.append((y, x - 1))  # left
+            stack.append((y, x + 1))  # right
+
+    # Flood fill based on mode
+    if mode == "corners":
+        # Only flood fill from the four corners
+        if not visited[0, 0]:
+            flood_fill(0, 0)
+        if not visited[0, w - 1]:
+            flood_fill(0, w - 1)
+        if not visited[h - 1, 0]:
+            flood_fill(h - 1, 0)
+        if not visited[h - 1, w - 1]:
+            flood_fill(h - 1, w - 1)
+    elif mode == "midpoints":
+        # Flood fill from the midpoint of each edge
+        mid_x = w // 2
+        mid_y = h // 2
+
+        # Top edge midpoint
+        if not visited[0, mid_x]:
+            flood_fill(0, mid_x)
+        # Bottom edge midpoint
+        if not visited[h - 1, mid_x]:
+            flood_fill(h - 1, mid_x)
+        # Left edge midpoint
+        if not visited[mid_y, 0]:
+            flood_fill(mid_y, 0)
+        # Right edge midpoint
+        if not visited[mid_y, w - 1]:
+            flood_fill(mid_y, w - 1)
+    else:  # mode == "edges" (default)
+        # Flood fill from all edges
+        # Top and bottom edges
+        for x in range(w):
+            if not visited[0, x]:
+                flood_fill(0, x)
+            if not visited[h - 1, x]:
+                flood_fill(h - 1, x)
+
+        # Left and right edges
+        for y in range(h):
+            if not visited[y, 0]:
+                flood_fill(y, 0)
+            if not visited[y, w - 1]:
+                flood_fill(y, w - 1)
+
+    return result  # type: ignore[no-any-return]
 
 def finalize_pixels(image: np.ndarray) -> np.ndarray:
     """Ensure pixels have binary alpha and transparent pixels are black"""
@@ -583,8 +703,8 @@ def edge_preserving_refinement(image: np.ndarray) -> np.ndarray:
 
 
 def quantize_colors(
-    image: np.ndarray, max_colors: int, fixed_palette: Optional[List[str]] = None
-) -> Tuple[np.ndarray, List[Tuple[int, int, int]]]:
+    image: np.ndarray, max_colors: int, fixed_palette: list[str] | None = None
+) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
     """Quantize image colors using Wu algorithm or fixed palette"""
     if fixed_palette:
         # Convert hex colors to RGB
@@ -633,7 +753,7 @@ def quantize_colors(
         return quantizer.quantize(image)
 
 
-def extract_palette(image: np.ndarray) -> List[str]:
+def extract_palette(image: np.ndarray) -> list[str]:
     """Extract color palette from image as hex strings"""
     h, w = image.shape[:2]
     unique_colors = set()
@@ -710,7 +830,7 @@ def detect_optimal_color_count(
     small_img = cv2.GaussianBlur(small_img, (5, 5), 1)
 
     # Gather color statistics with aggressive quantization
-    color_counts: Dict[str, int] = {}
+    color_counts: dict[str, int] = {}
     total_pixels = 0
 
     for y in range(small_img.shape[0]):
@@ -748,17 +868,20 @@ def detect_optimal_color_count(
 
 
 async def process_image(
-    file_path_or_image: Union[str, Image.Image, NDArray],
-    max_colors: Optional[int] = None,  # None for auto-detection
-    manual_scale: Optional[Union[int, List[int]]] = None,
+    file_path_or_image: str | Image.Image | NDArray,
+    max_colors: int | None = None,  # None for auto-detection
+    manual_scale: int | list[int] | None = None,
     detect_method: str = "auto",  # 'auto', 'runs', 'edge'
     downscale_method: str = "dominant",  # 'dominant', 'median', 'mode', 'mean', 'nearest', 'content-adaptive', 'hybrid'
     dom_mean_threshold: float = 0.05,
-    cleanup: Optional[Dict[str, bool]] = None,
-    fixed_palette: Optional[List[str]] = None,
-    alpha_threshold: int = 128,
+    cleanup: dict[str, bool] | None = None,
+    fixed_palette: list[str] | None = None,
+    alpha_threshold: int = 128,    
+    background_tolerance: int = 1,
+    background_mode: str = "edges",
     snap_grid: bool = True,
-    auto_color_detect: bool = False,
+    auto_color_detect: bool = False,    
+    transparent_background: bool = False,
     pre_filter: bool = False,
     edge_preserve: bool = False,
     post_sharpen: bool = False,
@@ -779,7 +902,8 @@ async def process_image(
         fixed_palette: Optional fixed color palette (hex strings)
         alpha_threshold: Alpha binarization threshold (0-255)
         snap_grid: Whether to snap to pixel grid
-        auto_color_detect: Force automatic color detection
+        auto_color_detect: Force automatic color detection        
+        transparent_background: Whether to make background transparent
         pre_filter: Apply pre-downscale filter
         edge_preserve: Apply edge-preserving refinement for content-adaptive
         post_sharpen: Apply post-downscale sharpening
@@ -813,17 +937,20 @@ async def process_image(
             assert file_path_or_image.shape[0] == 1, "Batch dimension is not supported"
             file_path_or_image = file_path_or_image[0]
 
-        if file_path_or_image.dtype != np.uint8:
-            file_path_or_image = (file_path_or_image * 255).astype(np.uint8)
+        if file_path_or_image.dtype != np.uint8:  # type: ignore[union-attr]
+            file_path_or_image = (file_path_or_image * 255).astype(np.uint8)  # type: ignore[union-attr,operator]
 
-        h, w, c = file_path_or_image.shape
+        h, w, c = file_path_or_image.shape  # type: ignore[union-attr]
         if c == 4:
-            current = file_path_or_image
+            current = file_path_or_image  # type: ignore[assignment]
         elif c == 3:
-            current = np.concatenate([
-                file_path_or_image,
-                (np.ones((h, w, 1)) * 255).astype(np.uint8),
-            ], axis=2)
+            current = np.concatenate(
+                [
+                    file_path_or_image,
+                    (np.ones((h, w, 1)) * 255).astype(np.uint8),
+                ],
+                axis=2,
+            )
         else:
             raise ValueError(f"Unsupported number of channels: {c}")
 
@@ -943,7 +1070,13 @@ async def process_image(
 
         # 6. Post-cleanup
         if cleanup.get("jaggy", False):
+            logger.info("Cleaning up jaggy edges")
             current_iter = jaggy_cleaner(current_iter)
+
+        # 6.5. Make background transparent
+        if transparent_background:
+            logger.info(f"Making background transparent (mode={background_mode})")
+            current = make_background_transparent(current, background_tolerance, background_mode)
 
         # Score: lower colors + higher edges (normalized)
         final_colors = count_colors(current_iter)
@@ -1009,7 +1142,7 @@ async def process_image(
 
 
 # Synchronous wrapper for the async function
-def process_image_sync(file_path: str, **kwargs: Any) -> Dict:
+def process_image_sync(file_path: str, **kwargs: Any) -> dict:
     """Synchronous version of process_image"""
     import asyncio
 
@@ -1120,6 +1253,7 @@ Examples:
             alpha_threshold=args.alpha_threshold,
             snap_grid=not args.no_snap,
             auto_color_detect=args.auto_colors,
+            transparent_background=args.transparent_background,
             pre_filter=args.pre_filter,
             edge_preserve=args.edge_preserve,
             post_sharpen=args.post_sharpen,

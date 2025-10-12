@@ -101,6 +101,7 @@ impl GaussianKernel {
         }
     }
 
+    // Accept precomputed inverse to avoid repeated inversion
     fn evaluate_weight(&self, x: f32, y: f32, inv_sigma: &Matrix2x2) -> f32 {
         let dx = x - self.mu[0];
         let dy = y - self.mu[1];
@@ -109,7 +110,7 @@ impl GaussianKernel {
     }
 }
 
-/// Extremely fast content-adaptive downscaling using EM-C algorithm
+/// Fast content-adaptive downscaling using EM-C algorithm
 pub fn content_adaptive_downscale_rust(
     lab_image: &ArrayView3<f32>,
     target_w: usize,
@@ -140,28 +141,27 @@ pub fn content_adaptive_downscale_rust(
     let search_radius_sq = search_radius * search_radius;
 
     // EM-C iterations
-    for _ in 0..num_iterations {
-        // Precompute inverse sigmas (always Some after clamping/initialization)
+    for iteration in 0..num_iterations {
+        // Precompute inverse covariance matrices (safe due to clamping in C-step)
         let inv_sigmas: Vec<Matrix2x2> = kernels
             .par_iter()
             .map(|kernel| kernel.sigma.inverse().unwrap())
             .collect();
 
-        // E-Step: Compute weights in parallel, using local pixel bounds per kernel for efficiency
+        // E-Step: Compute weights in parallel
         let mut all_weights: Vec<Vec<(usize, f32)>> = (0..num_kernels)
             .into_par_iter()
             .map(|k| {
                 let kernel = &kernels[k];
                 let inv_sigma = &inv_sigmas[k];
 
+                // Determine local pixel bounds for this kernel
                 let x_min = (kernel.mu[0] - search_radius).max(0.0) as usize;
                 let x_max = (kernel.mu[0] + search_radius).min(w_in as f32 - 1.0) as usize + 1;
                 let y_min = (kernel.mu[1] - search_radius).max(0.0) as usize;
                 let y_max = (kernel.mu[1] + search_radius).min(h_in as f32 - 1.0) as usize + 1;
 
-                let approx_capacity = (x_max - x_min) * (y_max - y_min);
-                let mut weights = Vec::with_capacity(approx_capacity / 2); // Conservative estimate
-
+                let mut weights = Vec::new();
                 for y in y_min..y_max {
                     for x in x_min..x_max {
                         let fx = x as f32;
@@ -169,11 +169,11 @@ pub fn content_adaptive_downscale_rust(
                         let dx = fx - kernel.mu[0];
                         let dy = fy - kernel.mu[1];
                         let dist_sq = dx * dx + dy * dy;
+
                         if dist_sq <= search_radius_sq {
                             let weight = kernel.evaluate_weight(fx, fy, inv_sigma);
                             if weight > 1e-5 {
-                                let pixel_idx = y * w_in + x;
-                                weights.push((pixel_idx, weight));
+                                weights.push((y * w_in + x, weight));
                             }
                         }
                     }
@@ -185,10 +185,10 @@ pub fn content_adaptive_downscale_rust(
         // Normalize weights
         let mut gamma_sums = vec![1e-9f32; h_in * w_in];
         for k in 0..num_kernels {
-            let w_sum: f32 = all_weights[k].iter().map(|&(_, w)| w).sum::<f32>() + 1e-9;
-            for &mut (pixel_idx, ref mut weight) in all_weights[k].iter_mut() {
+            let w_sum: f32 = all_weights[k].iter().map(|(_, w)| w).sum::<f32>() + 1e-9;
+            for (pixel_idx, weight) in &mut all_weights[k] {
                 *weight /= w_sum;
-                gamma_sums[pixel_idx] += *weight;
+                gamma_sums[*pixel_idx] += *weight;
             }
         }
 
@@ -749,6 +749,186 @@ pub fn downscale_dominant(image: &ArrayView3<u8>, scale: usize, threshold: f32) 
             result[(ty, tx, 1)] = 0;
             result[(ty, tx, 2)] = 0;
             result[(ty, tx, 3)] = 255;
+        }
+    }
+
+    result
+}
+
+/// Make background transparent by flood-filling from specified starting points
+pub fn make_background_transparent_rust(
+    image: &ArrayView3<u8>,
+    tolerance: i32,
+    mode: &str,
+) -> Array3<u8> {
+    let (height, width, channels) = image.dim();
+
+    // Ensure image has alpha channel
+    let (h, w, has_alpha) = if channels == 3 {
+        // Need to add alpha channel
+        (height, width, false)
+    } else {
+        (height, width, true)
+    };
+
+    // Create result with alpha channel
+    let mut result = if !has_alpha {
+        // Convert RGB to RGBA
+        let mut rgba = Array3::<u8>::zeros((h, w, 4));
+        for y in 0..h {
+            for x in 0..w {
+                rgba[(y, x, 0)] = image[(y, x, 0)];
+                rgba[(y, x, 1)] = image[(y, x, 1)];
+                rgba[(y, x, 2)] = image[(y, x, 2)];
+                rgba[(y, x, 3)] = 255; // Fully opaque
+            }
+        }
+        rgba
+    } else {
+        // Copy existing RGBA
+        let mut rgba = Array3::<u8>::zeros((h, w, 4));
+        for y in 0..h {
+            for x in 0..w {
+                rgba[(y, x, 0)] = image[(y, x, 0)];
+                rgba[(y, x, 1)] = image[(y, x, 1)];
+                rgba[(y, x, 2)] = image[(y, x, 2)];
+                rgba[(y, x, 3)] = image[(y, x, 3)];
+            }
+        }
+        rgba
+    };
+
+    let mut visited = vec![vec![false; w]; h];
+
+    // Helper function to check if two colors are similar
+    let is_similar = |c1: [u8; 3], c2: [u8; 3], tol: i32| -> bool {
+        ((c1[0] as i32 - c2[0] as i32).abs() <= tol)
+            && ((c1[1] as i32 - c2[1] as i32).abs() <= tol)
+            && ((c1[2] as i32 - c2[2] as i32).abs() <= tol)
+    };
+
+    // Flood fill function using iterative stack-based approach
+    let flood_fill = |result: &mut Array3<u8>,
+                      visited: &mut Vec<Vec<bool>>,
+                      start_y: usize,
+                      start_x: usize,
+                      tol: i32| {
+        // Skip if already visited or transparent
+        if visited[start_y][start_x] || result[(start_y, start_x, 3)] < 128 {
+            return;
+        }
+
+        let target_color = [
+            result[(start_y, start_x, 0)],
+            result[(start_y, start_x, 1)],
+            result[(start_y, start_x, 2)],
+        ];
+
+        let mut stack = vec![(start_y, start_x)];
+
+        while let Some((y, x)) = stack.pop() {
+            // Bounds check
+            if y >= h || x >= w {
+                continue;
+            }
+
+            // Skip if already visited
+            if visited[y][x] {
+                continue;
+            }
+
+            // Skip if already transparent
+            if result[(y, x, 3)] < 128 {
+                visited[y][x] = true;
+                continue;
+            }
+
+            // Check if color matches
+            let current_color = [result[(y, x, 0)], result[(y, x, 1)], result[(y, x, 2)]];
+            if !is_similar(current_color, target_color, tol) {
+                continue;
+            }
+
+            // Mark as visited and make transparent
+            visited[y][x] = true;
+            result[(y, x, 0)] = 0;
+            result[(y, x, 1)] = 0;
+            result[(y, x, 2)] = 0;
+            result[(y, x, 3)] = 0;
+
+            // Add neighbors to stack (with bounds checking)
+            if y > 0 {
+                stack.push((y - 1, x)); // up
+            }
+            if y + 1 < h {
+                stack.push((y + 1, x)); // down
+            }
+            if x > 0 {
+                stack.push((y, x - 1)); // left
+            }
+            if x + 1 < w {
+                stack.push((y, x + 1)); // right
+            }
+        }
+    };
+
+    // Flood fill based on mode
+    if mode == "corners" {
+        // Only flood fill from the four corners
+        if !visited[0][0] {
+            flood_fill(&mut result, &mut visited, 0, 0, tolerance);
+        }
+        if !visited[0][w - 1] {
+            flood_fill(&mut result, &mut visited, 0, w - 1, tolerance);
+        }
+        if !visited[h - 1][0] {
+            flood_fill(&mut result, &mut visited, h - 1, 0, tolerance);
+        }
+        if !visited[h - 1][w - 1] {
+            flood_fill(&mut result, &mut visited, h - 1, w - 1, tolerance);
+        }
+    } else if mode == "midpoints" {
+        // Flood fill from the midpoint of each edge
+        let mid_x = w / 2;
+        let mid_y = h / 2;
+
+        // Top edge midpoint
+        if !visited[0][mid_x] {
+            flood_fill(&mut result, &mut visited, 0, mid_x, tolerance);
+        }
+        // Bottom edge midpoint
+        if !visited[h - 1][mid_x] {
+            flood_fill(&mut result, &mut visited, h - 1, mid_x, tolerance);
+        }
+        // Left edge midpoint
+        if !visited[mid_y][0] {
+            flood_fill(&mut result, &mut visited, mid_y, 0, tolerance);
+        }
+        // Right edge midpoint
+        if !visited[mid_y][w - 1] {
+            flood_fill(&mut result, &mut visited, mid_y, w - 1, tolerance);
+        }
+    } else {
+        // mode == "edges" (default)
+        // Flood fill from all edges
+        // Top and bottom edges
+        for x in 0..w {
+            if !visited[0][x] {
+                flood_fill(&mut result, &mut visited, 0, x, tolerance);
+            }
+            if !visited[h - 1][x] {
+                flood_fill(&mut result, &mut visited, h - 1, x, tolerance);
+            }
+        }
+
+        // Left and right edges
+        for y in 0..h {
+            if !visited[y][0] {
+                flood_fill(&mut result, &mut visited, y, 0, tolerance);
+            }
+            if !visited[y][w - 1] {
+                flood_fill(&mut result, &mut visited, y, w - 1, tolerance);
+            }
         }
     }
 
