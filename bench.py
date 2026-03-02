@@ -205,15 +205,25 @@ def bench_palette_map(img_np: np.ndarray, palette: list,
         return {"stats": None}
     samples = []
     if rust:
-        try:
-            from unfake.pixel_rust_integration import map_pixels_to_palette_accelerated
-            call = lambda: map_pixels_to_palette_accelerated(img_np, palette)
-        except Exception:
-            from unfake.pixel_rust_integration import map_pixels_to_palette_accelerated as _fn
-            call = lambda: _fn(img_np, palette)
+        from unfake.pixel_rust_integration import map_pixels_to_palette_accelerated
+        call = lambda: map_pixels_to_palette_accelerated(img_np, palette)
     else:
-        from unfake.pixel_rust_integration import map_pixels_to_palette_accelerated as _fn
-        call = lambda: _fn(img_np, palette)
+        # Pure Python nearest-colour loop (the actual fallback inside pixel_rust_integration)
+        def _python_palette_map(pixels: np.ndarray, pal: list) -> np.ndarray:
+            h, w, c = pixels.shape
+            has_alpha = c == 4
+            out = np.zeros_like(pixels)
+            pal_arr = np.array(pal, dtype=np.int32)  # (K, 3)
+            rgb = pixels[:, :, :3].reshape(-1, 3).astype(np.int32)
+            # Vectorised nearest-colour: (N,1,3) - (1,K,3) → (N,K)
+            diff = rgb[:, None, :] - pal_arr[None, :, :]
+            idx = np.argmin((diff ** 2).sum(axis=2), axis=1)
+            best = pal_arr[idx].reshape(h, w, 3).astype(np.uint8)
+            out[:, :, :3] = best
+            if has_alpha:
+                out[:, :, 3] = np.where(pixels[:, :, 3] >= 128, 255, 0)
+            return out
+        call = lambda: _python_palette_map(img_np, palette)
 
     for _ in range(2):
         call()
@@ -226,7 +236,17 @@ def bench_palette_map(img_np: np.ndarray, palette: list,
 def bench_full_pipeline(img_np: np.ndarray, scale: int, threshold: float,
                          colors: int, sig_bits: int, method: str,
                          n: int, rust: bool) -> dict:
-    """Full end-to-end pipeline measured as a single unit."""
+    """Full end-to-end pipeline via process_image_sync.
+
+    NOTE: process_image_sync always uses Rust acceleration internally.
+    This stage is therefore only meaningful in the Rust pass; the Python
+    pass skips it and returns None so the summary table stays honest.
+    """
+    if not rust:
+        # process_image_sync has no pure-Python mode — skip rather than
+        # report a misleading number identical to the Rust row.
+        return {"stats": None}
+
     from unfake import process_image_sync
     samples = []
     for _ in range(2):
@@ -242,7 +262,6 @@ def bench_full_pipeline(img_np: np.ndarray, scale: int, threshold: float,
                 scale=scale, colors=colors, method=method, threshold=threshold,
             )
         except TypeError:
-            # signature varies — try positional
             _, elapsed = timeit(process_image_sync, img_np)
         samples.append(elapsed)
     return {"stats": stats(samples)}
@@ -380,8 +399,11 @@ def main() -> None:
                 args.colors, args.sig_bits, args.method if args.method != "both" else "dominant",
                 n, rust,
             )
-            print_row("full pipeline", r5["stats"])
-            results["full pipeline"] = r5["stats"]
+            if r5["stats"] is not None:
+                print_row("full pipeline", r5["stats"])
+                results["full pipeline"] = r5["stats"]
+            else:
+                print(f"  {DIM}full pipeline: skipped (no pure-Python mode){RESET}")
         except Exception as exc:
             print(f"  {DIM}full pipeline: skipped ({exc}){RESET}")
 
@@ -414,12 +436,11 @@ def main() -> None:
             print(f"  {stage:<26}  {_ms(r_mean):>10}  {_ms(p_mean):>10}  {speedup_str}")
 
         # Overall wall-clock comparison (full pipeline if available, else sum of stages)
-        if "full pipeline" in rust_r and "full pipeline" in py_r:
-            total_r = rust_r["full pipeline"]["mean"]
-            total_p = py_r["full pipeline"]["mean"]
-        else:
-            total_r = sum(v["mean"] for v in rust_r.values())
-            total_p = sum(v["mean"] for v in py_r.values())
+        # Sum of comparable stages (exclude full pipeline — it's only valid for Rust pass)
+        PIPELINE_STAGES = ["scale detect", "downscale dominant", "downscale mode",
+                           "wu quantize", "palette map"]
+        total_r = sum(rust_r[s]["mean"] for s in PIPELINE_STAGES if s in rust_r)
+        total_p = sum(py_r[s]["mean"]  for s in PIPELINE_STAGES if s in py_r)
         overall = total_p / total_r if total_r > 0 else float("inf")
         col = GREEN if overall >= 10 else YELLOW if overall >= 2 else RED
         print(f"  {'-'*26}  {'-'*10}  {'-'*10}  {'-'*9}")

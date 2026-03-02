@@ -1,4 +1,47 @@
-# unfake-opt
+# unfake-gpu
+
+* Moving to the GPU gives us another 10x speed improvement from unfake-opt. 
+* All ops sub 1 second for example image. I get about 233 ms total on my laptop.
+* Added demo with error metric and zoom tool (Has odd warping near edges of zoom tool)
+* Added benchmarking python script
+
+```
+unfake benchmark
+  image      : orig_2025-09-08-005621__0.png  (1312×976 px, 1.28 Mpx)
+  iterations : 10  (+ 2 warmup per stage)
+  colors     : 16   sig_bits=5
+  method     : both
+  rust       : yes
+
+─── Rust ───
+  scale detect                  mean 7.33 ms  min 4.53 ms  max 10.83 ms  med 7.28 ms  σ 2.17 ms  p95 10.83 ms
+  downscale dominant            mean 13.84 ms  min 11.87 ms  max 15.81 ms  med 13.94 ms  σ 1.20 ms  p95 15.81 ms
+  downscale mode                mean 15.19 ms  min 12.46 ms  max 20.70 ms  med 14.49 ms  σ 2.90 ms  p95 20.70 ms
+  wu quantize                   mean 167.95 ms  min 149.31 ms  max 188.94 ms  med 167.83 ms  σ 11.65 ms  p95 188.94 ms
+  palette map                   mean 14.42 ms  min 11.84 ms  max 19.66 ms  med 13.43 ms  σ 2.76 ms  p95 19.66 ms
+  full pipeline                 mean 233.17 ms  min 219.32 ms  max 254.20 ms  med 233.29 ms  σ 10.52 ms  p95 254.20 ms
+
+─── Python ───
+  scale detect                  mean 3.706 s  min 3.662 s  max 3.778 s  med 3.695 s  σ 39.23 ms  p95 3.778 s
+  downscale dominant            mean 36.014 s  min 35.805 s  max 36.265 s  med 36.019 s  σ 139.23 ms  p95 36.265 s
+  downscale mode                mean 23.97 ms  min 23.24 ms  max 25.41 ms  med 23.70 ms  σ 718.8 µs  p95 25.41 ms
+  wu quantize                   mean 53.391 s  min 51.971 s  max 62.651 s  med 52.316 s  σ 3.268 s  p95 62.651 s
+  palette map                   mean 449.64 ms  min 446.50 ms  max 458.49 ms  med 448.78 ms  σ 3.30 ms  p95 458.49 ms
+  full pipeline: skipped (no pure-Python mode)
+
+─── Speedup summary (Python ÷ Rust mean) ───
+  Stage                             Rust      Python    Speedup
+  --------------------------  ----------  ----------  ---------
+  scale detect                   7.33 ms     3.706 s   505.6×
+  downscale dominant            13.84 ms    36.014 s  2602.7×
+  downscale mode                15.19 ms    23.97 ms     1.6×
+  wu quantize                  167.95 ms    53.391 s   317.9×
+  palette map                   14.42 ms   449.64 ms    31.2×
+  --------------------------  ----------  ----------  ---------
+  OVERALL (pipeline)           218.73 ms    93.585 s   427.9×
+```
+
+---
 
 Improve AI-generated pixel art through scale detection, color quantization, and smart downscaling — now significantly faster and more accurate thanks to algorithmic and performance enhancements.  
 This optimized fork features **10–40× faster content-adaptive downscaling**, improved dominant color selection using **KMeans**, a new **hybrid downscaling method**, and additional preprocessing/postprocessing options for sharper, cleaner pixel art.
