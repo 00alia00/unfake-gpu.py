@@ -1,23 +1,70 @@
 [package]
 name = "unfake"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
 
+# ── Library (cdylib for Python .so, rlib for Rust linking) ─────────────────────
 [lib]
 name = "unfake"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 path = "rust/lib.rs"
 
-[dependencies]
-pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"] }
-numpy = "0.20"
-ndarray = { version = "0.15", features = ["rayon"] }
-rayon = "1.8"
-num-traits = "0.2"
-rand = "0.8"
+# ── egui / wgpu interactive demo ────────────────────────────────────────────────
+[[bin]]
+name = "unfake-demo"
+path = "demo/main.rs"
+required-features = ["demo"]
 
+# ── Features ────────────────────────────────────────────────────────────────────
+[features]
+default = ["gpu"]
+
+# Enable Python bindings (pyo3 / numpy).  Disabled for pure-Rust builds.
+python = ["dep:pyo3", "dep:numpy"]
+
+# Enable wgpu compute-shader acceleration.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# Build the interactive egui demo (implies gpu).
+demo = ["gpu", "dep:eframe", "dep:image", "dep:rfd"]
+
+# ── Core dependencies (always compiled) ─────────────────────────────────────────
+[dependencies]
+ndarray    = { version = "0.15", features = ["rayon"] }
+rayon      = "1.8"
+num-traits = "0.2"
+rand       = "0.8"
+
+# ── Python bindings ──────────────────────────────────────────────────────────────
+pyo3   = { version = "0.21", features = ["extension-module", "abi3-py38"], optional = true }
+numpy  = { version = "0.21", optional = true }
+
+# ── wgpu GPU acceleration ────────────────────────────────────────────────────────
+# Target wgpu v28 (latest stable as of Dec 2025).  Key v28 API used here:
+#   • `immediate_size` (PipelineLayoutDescriptor) replaces `push_constant_ranges`
+#   • `set_immediates` on compute passes replaces `set_push_constants`
+#   • `var<immediate>` address space in WGSL replaces `var<push_constant>`
+#   • `request_adapter` returns Result (v25+)
+#   • Optional entry points (v23+)
+#   • `map_buffer_on_submit` deferred mapping (v27+)
+wgpu     = { version = "28", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1.14", features = ["derive"], optional = true }
+
+# ── Demo UI ──────────────────────────────────────────────────────────────────────
+# eframe bundles egui + winit + wgpu renderer.  The "wgpu" eframe feature exposes
+# the underlying wgpu Device/Queue so our compute shaders share the same GPU context
+# as the egui renderer — no double-init.
+eframe = { version = "0.33", features = ["wgpu"], optional = true }
+image  = { version = "0.25", optional = true }
+rfd    = { version = "0.15", optional = true }
+
+# ── Build profiles ───────────────────────────────────────────────────────────────
 [profile.release]
-lto = true
+lto           = true
 codegen-units = 1
-opt-level = 3
-strip = true
+opt-level     = 3
+strip         = true
+
+[profile.dev]
+opt-level = 1   # keep wgpu usable in debug builds

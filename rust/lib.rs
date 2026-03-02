@@ -1,15 +1,33 @@
+//! `unfake` Rust core library.
+//!
+//! Feature flags:
+//!   `python` – enable pyo3 / numpy Python bindings (required for `.so`).
+//!   `gpu`    – enable wgpu compute-shader acceleration (default on).
+
+// ── Conditional pyo3 imports ─────────────────────────────────────────────────
+#[cfg(feature = "python")]
 use numpy::{PyArray3, PyReadonlyArray3};
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+
 use rayon::prelude::*;
 use std::sync::Mutex;
 
-mod quantizer;
-mod utils;
+// ── Core modules ─────────────────────────────────────────────────────────────
+pub mod quantizer;
+pub mod utils;
 
+// ── GPU acceleration module (disabled if wgpu not requested) ────────────────
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
+#[cfg(feature = "python")]
 use quantizer::WuQuantizerRust;
+#[cfg(feature = "python")]
 use utils::content_adaptive_downscale_rust;
 use utils::downscale_dominant;
 use utils::downscale_mode;
+#[cfg(feature = "python")]
 use utils::make_background_transparent_rust;
 
 /// Calculate GCD of two numbers
@@ -38,7 +56,63 @@ fn gcd_of_vec(numbers: &[u32]) -> u32 {
     result
 }
 
+/// Runs-based scale detection (pure Rust API)
+pub fn runs_based_detect_rs(image: ndarray::ArrayView3<u8>) -> u32 {
+    let (height, width, channels) = image.dim();
+    let horizontal_runs: Vec<u32> = (0..height)
+        .into_par_iter()
+        .flat_map(|y| {
+            let mut runs = Vec::new();
+            let mut run_length = 1u32;
+            for x in 1..width {
+                let same = (0..channels).all(|c| image[(y, x, c)] == image[(y, x - 1, c)]);
+                if same {
+                    run_length += 1;
+                } else {
+                    if run_length > 1 {
+                        runs.push(run_length);
+                    }
+                    run_length = 1;
+                }
+            }
+            if run_length > 1 {
+                runs.push(run_length);
+            }
+            runs
+        })
+        .collect();
+    let vertical_runs: Vec<u32> = (0..width)
+        .into_par_iter()
+        .flat_map(|x| {
+            let mut runs = Vec::new();
+            let mut run_length = 1u32;
+            for y in 1..height {
+                let same = (0..channels).all(|c| image[(y, x, c)] == image[(y - 1, x, c)]);
+                if same {
+                    run_length += 1;
+                } else {
+                    if run_length > 1 {
+                        runs.push(run_length);
+                    }
+                    run_length = 1;
+                }
+            }
+            if run_length > 1 {
+                runs.push(run_length);
+            }
+            runs
+        })
+        .collect();
+    let mut all_runs = horizontal_runs;
+    all_runs.extend(vertical_runs);
+    if all_runs.len() < 10 {
+        return 1;
+    }
+    gcd_of_vec(&all_runs).max(1)
+}
+
 /// Runs-based scale detection
+#[cfg(feature = "python")]
 #[pyfunction]
 fn runs_based_detect(_py: Python<'_>, image: PyReadonlyArray3<u8>) -> PyResult<u32> {
     let img_array = image.as_array();
@@ -122,90 +196,106 @@ fn runs_based_detect(_py: Python<'_>, image: PyReadonlyArray3<u8>) -> PyResult<u
     Ok(scale.max(1))
 }
 
-/// Map pixels to nearest palette colors
+/// Map pixels to nearest palette colours (pure Rust, GPU-accelerated when available).
+pub fn map_pixels_to_palette_rs(
+    pixels: ndarray::ArrayView3<u8>,
+    palette: Vec<(u8, u8, u8)>,
+) -> ndarray::Array3<u8> {
+    // ─ GPU fast path ───────────────────────────────────────────────────
+    #[cfg(feature = "gpu")]
+    if let Some(ctx) = gpu::gpu_context() {
+        if let Some(result) = gpu::palette::map_pixels_gpu(&ctx, &pixels, &palette) {
+            return result;
+        }
+    }
+    // ─ CPU fallback ─────────────────────────────────────────────────────
+    let (height, width, channels) = pixels.dim();
+    let has_alpha = channels == 4;
+    let mut output = ndarray::Array3::<u8>::zeros((height, width, channels));
+    let results = Mutex::new(Vec::with_capacity(height * width));
+    let chunk_size = 64;
+    (0..height)
+        .into_par_iter()
+        .step_by(chunk_size)
+        .for_each(|y_start| {
+            let y_end = (y_start + chunk_size).min(height);
+            let mut chunk = Vec::with_capacity((y_end - y_start) * width);
+            for y in y_start..y_end {
+                for x in 0..width {
+                    if has_alpha && pixels[(y, x, 3)] < 128 {
+                        chunk.push((y, x, 0u8, 0u8, 0u8, 0u8));
+                        continue;
+                    }
+                    let (pr, pg, pb) = (
+                        pixels[(y, x, 0)] as i32,
+                        pixels[(y, x, 1)] as i32,
+                        pixels[(y, x, 2)] as i32,
+                    );
+                    let (&best_r, &best_g, &best_b) = palette
+                        .iter()
+                        .map(|c| {
+                            let dr = pr - c.0 as i32;
+                            let dg = pg - c.1 as i32;
+                            let db = pb - c.2 as i32;
+                            (dr * dr + dg * dg + db * db, c)
+                        })
+                        .min_by_key(|&(d, _)| d)
+                        .map(|(_, c)| (&c.0, &c.1, &c.2))
+                        .unwrap();
+                    let a = if has_alpha { 255u8 } else { 0u8 };
+                    chunk.push((y, x, best_r, best_g, best_b, a));
+                }
+            }
+            results.lock().unwrap().extend(chunk);
+        });
+    for (y, x, r, g, b, a) in results.into_inner().unwrap() {
+        output[(y, x, 0)] = r;
+        output[(y, x, 1)] = g;
+        output[(y, x, 2)] = b;
+        if has_alpha {
+            output[(y, x, 3)] = a;
+        }
+    }
+    output
+}
+
+/// Map pixels to nearest palette colors (Python binding)
+#[cfg(feature = "python")]
 #[pyfunction]
 fn map_pixels_to_palette(
     py: Python<'_>,
     pixels: PyReadonlyArray3<u8>,
     palette: Vec<(u8, u8, u8)>,
 ) -> PyResult<Py<PyArray3<u8>>> {
-    let img_array = pixels.as_array();
-    let (height, width, channels) = img_array.dim();
-    let has_alpha = channels == 4;
-
-    // Create output array
-    let output_array = unsafe { PyArray3::<u8>::new(py, [height, width, channels], false) };
-
-    // Create a thread-safe wrapper for collecting results
-    let results = Mutex::new(Vec::with_capacity(height * width));
-
-    // Process pixels in parallel chunks
-    let chunk_size = 64; // Process in 64x64 chunks for cache efficiency
-
-    (0..height)
-        .into_par_iter()
-        .step_by(chunk_size)
-        .for_each(|y_start| {
-            let y_end = (y_start + chunk_size).min(height);
-            let mut chunk_results = Vec::with_capacity((y_end - y_start) * width);
-
-            for x_start in (0..width).step_by(chunk_size) {
-                let x_end = (x_start + chunk_size).min(width);
-
-                // Process chunk
-                for y in y_start..y_end {
-                    for x in x_start..x_end {
-                        if has_alpha && img_array[(y, x, 3)] < 128 {
-                            // Transparent pixel
-                            chunk_results.push((y, x, 0, 0, 0, 0));
-                        } else {
-                            // Find nearest palette color
-                            let pixel_r = img_array[(y, x, 0)] as i32;
-                            let pixel_g = img_array[(y, x, 1)] as i32;
-                            let pixel_b = img_array[(y, x, 2)] as i32;
-
-                            let mut min_dist = i32::MAX;
-                            let mut best_color = &palette[0];
-
-                            for color in &palette {
-                                let dr = pixel_r - color.0 as i32;
-                                let dg = pixel_g - color.1 as i32;
-                                let db = pixel_b - color.2 as i32;
-                                let dist = dr * dr + dg * dg + db * db;
-
-                                if dist < min_dist {
-                                    min_dist = dist;
-                                    best_color = color;
-                                }
-                            }
-
-                            let a = if has_alpha { 255 } else { 0 };
-                            chunk_results.push((y, x, best_color.0, best_color.1, best_color.2, a));
-                        }
-                    }
-                }
-            }
-
-            results.lock().unwrap().extend(chunk_results);
-        });
-
-    // Write results to output array
-    let results = results.into_inner().unwrap();
-    for (y, x, r, g, b, a) in results {
+    let arr = pixels.as_array();
+    let result = map_pixels_to_palette_rs(arr, palette);
+    let (h, w, c) = result.dim();
+    let out = unsafe { PyArray3::<u8>::new(py, [h, w, c], false) };
+    for ((y, x, ch), &v) in result.indexed_iter() {
         unsafe {
-            *output_array.uget_mut([y, x, 0]) = r;
-            *output_array.uget_mut([y, x, 1]) = g;
-            *output_array.uget_mut([y, x, 2]) = b;
-            if has_alpha {
-                *output_array.uget_mut([y, x, 3]) = a;
-            }
+            *out.uget_mut([y, x, ch]) = v;
         }
     }
-
-    Ok(output_array.into())
+    Ok(out.into())
 }
 
-/// Downscale image using dominant color method
+/// Downscale image using dominant color method (pure Rust, GPU-accelerated)
+pub fn downscale_dominant_color_rs(
+    image: ndarray::ArrayView3<u8>,
+    scale: usize,
+    threshold: f32,
+) -> ndarray::Array3<u8> {
+    #[cfg(feature = "gpu")]
+    if let Some(ctx) = gpu::gpu_context() {
+        if let Some(r) = gpu::downscale::downscale_dominant_gpu(&ctx, &image, scale, threshold) {
+            return r;
+        }
+    }
+    downscale_dominant(&image, scale, threshold)
+}
+
+/// Downscale image using dominant color method (Python binding)
+#[cfg(feature = "python")]
 #[pyfunction]
 fn downscale_dominant_color(
     _py: Python<'_>,
@@ -214,7 +304,7 @@ fn downscale_dominant_color(
     threshold: f32,
 ) -> PyResult<Py<PyArray3<u8>>> {
     let img_array = image.as_array();
-    let result = downscale_dominant(&img_array, scale, threshold);
+    let result = downscale_dominant_color_rs(img_array, scale, threshold);
 
     // Convert ndarray::Array3 to PyArray3
     let (h, w, c) = result.dim();
@@ -230,7 +320,22 @@ fn downscale_dominant_color(
     Ok(py_array.into())
 }
 
-/// Downscale image using mode (most frequent color) method
+/// Downscale image using mode (most frequent color) method - pure Rust API
+pub fn downscale_mode_color_rs(
+    image: ndarray::ArrayView3<u8>,
+    scale: usize,
+) -> ndarray::Array3<u8> {
+    #[cfg(feature = "gpu")]
+    if let Some(ctx) = gpu::gpu_context() {
+        if let Some(r) = gpu::downscale::downscale_mode_gpu(&ctx, &image, scale) {
+            return r;
+        }
+    }
+    downscale_mode(&image, scale)
+}
+
+/// Downscale image using mode (most frequent color) method (Python binding)
+#[cfg(feature = "python")]
 #[pyfunction]
 fn downscale_mode_method(
     _py: Python<'_>,
@@ -238,7 +343,7 @@ fn downscale_mode_method(
     scale: usize,
 ) -> PyResult<Py<PyArray3<u8>>> {
     let img_array = image.as_array();
-    let result = downscale_mode(&img_array, scale);
+    let result = downscale_mode_color_rs(img_array, scale);
 
     // Convert ndarray::Array3 to PyArray3
     let (h, w, c) = result.dim();
@@ -255,6 +360,7 @@ fn downscale_mode_method(
 }
 
 /// Count unique opaque colors in an image
+#[cfg(feature = "python")]
 #[pyfunction]
 fn count_unique_colors(_py: Python<'_>, image: PyReadonlyArray3<u8>) -> PyResult<usize> {
     let img_array = image.as_array();
@@ -285,6 +391,7 @@ fn count_unique_colors(_py: Python<'_>, image: PyReadonlyArray3<u8>) -> PyResult
 }
 
 /// Finalize pixels by ensuring binary alpha and black transparent pixels
+#[cfg(feature = "python")]
 #[pyfunction]
 fn finalize_pixels_rust(
     _py: Python<'_>,
@@ -335,6 +442,7 @@ fn finalize_pixels_rust(
 }
 
 /// Content-adaptive downscaling using EM-C algorithm
+#[cfg(feature = "python")]
 #[pyfunction]
 fn content_adaptive_downscale(
     py: Python<'_>,
@@ -363,6 +471,7 @@ fn content_adaptive_downscale(
 }
 
 /// Make background transparent by flood-filling from specified starting points
+#[cfg(feature = "python")]
 #[pyfunction]
 fn make_background_transparent(
     py: Python<'_>,
@@ -391,6 +500,7 @@ fn make_background_transparent(
 }
 
 /// Python module
+#[cfg(feature = "python")]
 #[pymodule]
 fn unfake(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runs_based_detect, m)?)?;

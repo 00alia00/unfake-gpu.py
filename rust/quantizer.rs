@@ -1,5 +1,7 @@
 use ndarray::{Array3, ArrayView3};
+#[cfg(feature = "python")]
 use numpy::{PyArray3, PyReadonlyArray3};
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::sync::Mutex;
@@ -29,7 +31,7 @@ impl Box3D {
     }
 }
 
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct WuQuantizerRust {
     weights: Array3<i64>,
     moments_r: Array3<i64>,
@@ -43,25 +45,12 @@ pub struct WuQuantizerRust {
     boxes: Vec<Box3D>,
 }
 
-#[pymethods]
+#[cfg(feature = "python")]
+#[pyo3::prelude::pymethods]
 impl WuQuantizerRust {
     #[new]
-    fn new(max_colors: usize, significant_bits: u8) -> Self {
-        let side_size = 1 << significant_bits;
-        let max_side_index = side_size - 1;
-
-        Self {
-            weights: Array3::<i64>::zeros((side_size, side_size, side_size)),
-            moments_r: Array3::<i64>::zeros((side_size, side_size, side_size)),
-            moments_g: Array3::<i64>::zeros((side_size, side_size, side_size)),
-            moments_b: Array3::<i64>::zeros((side_size, side_size, side_size)),
-            moments: Array3::<f64>::zeros((side_size, side_size, side_size)),
-            max_colors,
-            significant_bits,
-            side_size,
-            max_side_index,
-            boxes: vec![Box3D::new(); max_colors],
-        }
+    fn py_new(max_colors: usize, significant_bits: u8) -> Self {
+        Self::new(max_colors, significant_bits)
     }
 
     fn quantize(
@@ -96,14 +85,64 @@ impl WuQuantizerRust {
         // Generate palette from boxes
         let palette = self.generate_palette(n_boxes);
 
-        // Map pixels to palette
-        let output = self.map_pixels_to_palette(py, &img_array, &palette)?;
+        // Map pixels to palette (returns pure Array3<u8>)
+        let output_arr = self.map_pixels_to_palette(&img_array, &palette);
+
+        // Convert Array3<u8> to Py<PyArray3<u8>>
+        let (h, w, c) = output_arr.dim();
+        let py_array = unsafe { PyArray3::<u8>::new(py, [h, w, c], false) };
+        for ((y, x, ch), &value) in output_arr.indexed_iter() {
+            unsafe {
+                *py_array.uget_mut([y, x, ch]) = value;
+            }
+        }
+        let output: Py<PyArray3<u8>> = py_array.into();
 
         Ok((output, palette))
     }
 }
 
 impl WuQuantizerRust {
+    /// Create a new Wu quantizer.  Also serves as the `#[new]` constructor in Python.
+    pub fn new(max_colors: usize, significant_bits: u8) -> Self {
+        let side_size = 1 << significant_bits;
+        let max_side_index = side_size - 1;
+        Self {
+            weights: Array3::<i64>::zeros((side_size, side_size, side_size)),
+            moments_r: Array3::<i64>::zeros((side_size, side_size, side_size)),
+            moments_g: Array3::<i64>::zeros((side_size, side_size, side_size)),
+            moments_b: Array3::<i64>::zeros((side_size, side_size, side_size)),
+            moments: Array3::<f64>::zeros((side_size, side_size, side_size)),
+            max_colors,
+            significant_bits,
+            side_size,
+            max_side_index,
+            boxes: vec![Box3D::new(); max_colors],
+        }
+    }
+
+    /// Pure-Rust quantise — no pyo3 dependency.  Returns mapped pixels + palette.
+    pub fn quantize_rs(&mut self, pixels: &ArrayView3<u8>) -> (Array3<u8>, Vec<(u8, u8, u8)>) {
+        self.weights.fill(0);
+        self.moments_r.fill(0);
+        self.moments_g.fill(0);
+        self.moments_b.fill(0);
+        self.moments.fill(0.0);
+
+        self.build_histogram(pixels);
+        self.compute_cumulative_moments();
+
+        self.boxes = vec![Box3D::new(); self.max_colors];
+        self.boxes[0].r_max = self.max_side_index;
+        self.boxes[0].g_max = self.max_side_index;
+        self.boxes[0].b_max = self.max_side_index;
+
+        let n_boxes = self.build_color_boxes();
+        let palette = self.generate_palette(n_boxes);
+        let mapped = self.map_pixels_to_palette(pixels, &palette);
+        (mapped, palette)
+    }
+
     fn build_histogram(&mut self, pixels: &ArrayView3<u8>) {
         let (height, width, channels) = pixels.dim();
         let has_alpha = channels == 4;
@@ -547,89 +586,80 @@ impl WuQuantizerRust {
 
     fn map_pixels_to_palette(
         &self,
-        py: Python<'_>,
         pixels: &ArrayView3<u8>,
         palette: &[(u8, u8, u8)],
-    ) -> PyResult<Py<PyArray3<u8>>> {
+    ) -> Array3<u8> {
         let (height, width, channels) = pixels.dim();
         let has_alpha = channels == 4;
 
-        // Create output array
-        let output_array = unsafe { PyArray3::<u8>::new(py, [height, width, channels], false) };
+        // Collect results in parallel
+        let results: Vec<(usize, usize, u8, u8, u8, u8)> = {
+            let collector = Mutex::new(Vec::with_capacity(height * width));
+            let chunk_size = 64;
 
-        // Create a thread-safe wrapper for collecting results
-        let results = Mutex::new(Vec::with_capacity(height * width));
+            (0..height)
+                .into_par_iter()
+                .step_by(chunk_size)
+                .for_each(|y_start| {
+                    let y_end = (y_start + chunk_size).min(height);
+                    let mut chunk_results = Vec::with_capacity((y_end - y_start) * width);
 
-        // Process pixels in parallel chunks
-        let chunk_size = 64; // Process in 64x64 chunks for cache efficiency
+                    for x_start in (0..width).step_by(chunk_size) {
+                        let x_end = (x_start + chunk_size).min(width);
 
-        (0..height)
-            .into_par_iter()
-            .step_by(chunk_size)
-            .for_each(|y_start| {
-                let y_end = (y_start + chunk_size).min(height);
-                let mut chunk_results = Vec::with_capacity((y_end - y_start) * width);
+                        for y in y_start..y_end {
+                            for x in x_start..x_end {
+                                if has_alpha && pixels[(y, x, 3)] < 128 {
+                                    chunk_results.push((y, x, 0, 0, 0, 0));
+                                } else {
+                                    let pixel_r = pixels[(y, x, 0)] as i32;
+                                    let pixel_g = pixels[(y, x, 1)] as i32;
+                                    let pixel_b = pixels[(y, x, 2)] as i32;
 
-                for x_start in (0..width).step_by(chunk_size) {
-                    let x_end = (x_start + chunk_size).min(width);
+                                    let mut min_dist = i32::MAX;
+                                    let mut best_color = &palette[0];
 
-                    // Process chunk
-                    for y in y_start..y_end {
-                        for x in x_start..x_end {
-                            if has_alpha && pixels[(y, x, 3)] < 128 {
-                                // Transparent pixel
-                                chunk_results.push((y, x, 0, 0, 0, 0));
-                            } else {
-                                // Find nearest palette color
-                                let pixel_r = pixels[(y, x, 0)] as i32;
-                                let pixel_g = pixels[(y, x, 1)] as i32;
-                                let pixel_b = pixels[(y, x, 2)] as i32;
+                                    for color in palette {
+                                        let dr = pixel_r - color.0 as i32;
+                                        let dg = pixel_g - color.1 as i32;
+                                        let db = pixel_b - color.2 as i32;
+                                        let dist = dr * dr + dg * dg + db * db;
 
-                                let mut min_dist = i32::MAX;
-                                let mut best_color = &palette[0];
-
-                                for color in palette {
-                                    let dr = pixel_r - color.0 as i32;
-                                    let dg = pixel_g - color.1 as i32;
-                                    let db = pixel_b - color.2 as i32;
-                                    let dist = dr * dr + dg * dg + db * db;
-
-                                    if dist < min_dist {
-                                        min_dist = dist;
-                                        best_color = color;
+                                        if dist < min_dist {
+                                            min_dist = dist;
+                                            best_color = color;
+                                        }
                                     }
-                                }
 
-                                let a = if has_alpha { 255 } else { 0 };
-                                chunk_results.push((
-                                    y,
-                                    x,
-                                    best_color.0,
-                                    best_color.1,
-                                    best_color.2,
-                                    a,
-                                ));
+                                    let a = if has_alpha { 255u8 } else { 0u8 };
+                                    chunk_results.push((
+                                        y,
+                                        x,
+                                        best_color.0,
+                                        best_color.1,
+                                        best_color.2,
+                                        a,
+                                    ));
+                                }
                             }
                         }
                     }
-                }
 
-                results.lock().unwrap().extend(chunk_results);
-            });
+                    collector.lock().unwrap().extend(chunk_results);
+                });
 
-        // Write results to output array
-        let results = results.into_inner().unwrap();
+            collector.into_inner().unwrap()
+        };
+
+        let mut output = Array3::<u8>::zeros((height, width, channels));
         for (y, x, r, g, b, a) in results {
-            unsafe {
-                *output_array.uget_mut([y, x, 0]) = r;
-                *output_array.uget_mut([y, x, 1]) = g;
-                *output_array.uget_mut([y, x, 2]) = b;
-                if has_alpha {
-                    *output_array.uget_mut([y, x, 3]) = a;
-                }
+            output[(y, x, 0)] = r;
+            output[(y, x, 1)] = g;
+            output[(y, x, 2)] = b;
+            if has_alpha {
+                output[(y, x, 3)] = a;
             }
         }
-
-        Ok(output_array.into())
+        output
     }
 }

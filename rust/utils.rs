@@ -1,10 +1,8 @@
 use ndarray::{Array3, ArrayView3};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::collections::HashMap;
-
-use pyo3::prelude::*;
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
 
 /// Simple 2x2 matrix for covariance operations
 #[derive(Clone, Copy, Debug)]
@@ -399,11 +397,11 @@ fn kmeans_plusplus(points: &Vec<[f32; 3]>, k: usize, rng: &mut StdRng) -> Vec<[f
     }
 
     let mut centroids = Vec::with_capacity(k);
-    
+
     // Choose first centroid randomly
     let first_idx = rng.gen_range(0..n);
     centroids.push(points[first_idx]);
-    
+
     // Choose remaining centroids
     for _ in 1..k {
         // Calculate distances to nearest centroid for each point
@@ -418,7 +416,7 @@ fn kmeans_plusplus(points: &Vec<[f32; 3]>, k: usize, rng: &mut StdRng) -> Vec<[f
             }
             distances.push(min_dist);
         }
-        
+
         // Choose next centroid with probability proportional to distance^2
         let total_weight: f32 = distances.iter().sum();
         if total_weight <= 0.0 {
@@ -428,7 +426,7 @@ fn kmeans_plusplus(points: &Vec<[f32; 3]>, k: usize, rng: &mut StdRng) -> Vec<[f
         } else {
             let mut rand_val: f32 = rng.gen();
             rand_val *= total_weight;
-            
+
             let mut cumulative = 0.0;
             let mut chosen_idx = 0;
             for (i, &weight) in distances.iter().enumerate() {
@@ -441,7 +439,7 @@ fn kmeans_plusplus(points: &Vec<[f32; 3]>, k: usize, rng: &mut StdRng) -> Vec<[f
             centroids.push(points[chosen_idx]);
         }
     }
-    
+
     centroids
 }
 
@@ -452,11 +450,12 @@ fn euclidean_distance_squared(a: &[f32; 3], b: &[f32; 3]) -> f32 {
     dx * dx + dy * dy + dz * dz
 }
 
-fn euclidean_distance(a: &[f32; 3], b: &[f32; 3]) -> f32 {
-    euclidean_distance_squared(a, b).sqrt()
-}
-
-fn kmeans_with_seed(points: &Vec<[f32; 3]>, k: usize, max_iters: usize, seed: u64) -> Option<KMeansResult> {
+fn kmeans_with_seed(
+    points: &Vec<[f32; 3]>,
+    k: usize,
+    max_iters: usize,
+    seed: u64,
+) -> Option<KMeansResult> {
     if points.is_empty() || k == 0 {
         return None;
     }
@@ -465,7 +464,7 @@ fn kmeans_with_seed(points: &Vec<[f32; 3]>, k: usize, max_iters: usize, seed: u6
         // Special case: each point is its own cluster
         let mut labels = Vec::with_capacity(points.len());
         let mut centroids = Vec::with_capacity(k);
-        
+
         for i in 0..points.len() {
             labels.push(i);
             centroids.push(points[i]);
@@ -475,23 +474,22 @@ fn kmeans_with_seed(points: &Vec<[f32; 3]>, k: usize, max_iters: usize, seed: u6
             centroids.push(points[0]); // pad with first point
             labels.push(0);
         }
-        
+
         return Some(KMeansResult { centroids, labels });
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut centroids = kmeans_plusplus(points, k, &mut rng);
-    
+
     let mut labels = vec![0; points.len()];
-    let mut prev_labels = vec![usize::MAX; points.len()];
-    
+
     for _iter in 0..max_iters {
         // Assignment step
         let mut changed = false;
         for (i, point) in points.iter().enumerate() {
             let mut min_dist = f32::MAX;
             let mut best_centroid = 0;
-            
+
             for (j, centroid) in centroids.iter().enumerate() {
                 let dist = euclidean_distance_squared(point, centroid);
                 if dist < min_dist {
@@ -499,21 +497,21 @@ fn kmeans_with_seed(points: &Vec<[f32; 3]>, k: usize, max_iters: usize, seed: u6
                     best_centroid = j;
                 }
             }
-            
+
             if labels[i] != best_centroid {
                 changed = true;
                 labels[i] = best_centroid;
             }
         }
-        
+
         if !changed {
             break;
         }
-        
+
         // Update step
         let mut new_centroids = vec![[0.0, 0.0, 0.0]; k];
         let mut counts = vec![0; k];
-        
+
         for (i, &label) in labels.iter().enumerate() {
             if label < k {
                 new_centroids[label][0] += points[i][0];
@@ -522,7 +520,7 @@ fn kmeans_with_seed(points: &Vec<[f32; 3]>, k: usize, max_iters: usize, seed: u6
                 counts[label] += 1;
             }
         }
-        
+
         // Calculate new centroids
         for i in 0..k {
             if counts[i] > 0 {
@@ -534,10 +532,10 @@ fn kmeans_with_seed(points: &Vec<[f32; 3]>, k: usize, max_iters: usize, seed: u6
                 new_centroids[i] = centroids[i];
             }
         }
-        
+
         centroids = new_centroids;
     }
-    
+
     Some(KMeansResult { centroids, labels })
 }
 
@@ -675,7 +673,7 @@ pub fn downscale_dominant(image: &ArrayView3<u8>, scale: usize, threshold: f32) 
                                 .max_by_key(|(_, &size)| size)
                                 .map(|(idx, _)| idx)
                                 .unwrap_or(0);
-                            
+
                             let dominant_cluster_size = cluster_sizes[dominant_cluster_idx];
                             let total_pixels = color_pixels.len();
 
@@ -738,7 +736,7 @@ pub fn downscale_dominant(image: &ArrayView3<u8>, scale: usize, threshold: f32) 
             result[(ty, tx, 0)] = rgb[0];
             result[(ty, tx, 1)] = rgb[1];
             result[(ty, tx, 2)] = rgb[2];
-            
+
             // Set alpha to 255 if no alpha channel
             if !has_alpha {
                 result[(ty, tx, 3)] = 255;
