@@ -17,16 +17,7 @@ impl Matrix2x2 {
     fn new(a: f32, b: f32, c: f32, d: f32) -> Self {
         Self { a, b, c, d }
     }
-
-    fn multiply(&self, other: &Matrix2x2) -> Matrix2x2 {
-        Matrix2x2::new(
-            self.a * other.a + self.b * other.c,
-            self.a * other.b + self.b * other.d,
-            self.c * other.a + self.d * other.c,
-            self.c * other.b + self.d * other.d,
-        )
-    }
-
+    
     fn determinant(&self) -> f32 {
         self.a * self.d - self.b * self.c
     }
@@ -139,7 +130,7 @@ pub fn content_adaptive_downscale_rust(
     let search_radius_sq = search_radius * search_radius;
 
     // EM-C iterations
-    for iteration in 0..num_iterations {
+    for _iteration in 0..num_iterations {
         // Precompute inverse covariance matrices (safe due to clamping in C-step)
         let inv_sigmas: Vec<Matrix2x2> = kernels
             .par_iter()
