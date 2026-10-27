@@ -15,6 +15,11 @@ name = "unfake-demo"
 path = "demo/main.rs"
 required-features = ["demo"]
 
+[[bin]]
+name = "unfake-cli"
+path = "rust/main.rs"
+required-features = ["cli"]
+
 # ── Features ────────────────────────────────────────────────────────────────────
 [features]
 default = ["gpu"]
@@ -27,6 +32,7 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 # Build the interactive egui demo (implies gpu).
 demo = ["gpu", "dep:eframe", "dep:image", "dep:rfd"]
+cli = ["dep:image"]
 
 # ── Core dependencies (always compiled) ─────────────────────────────────────────
 [dependencies]
@@ -56,7 +62,7 @@ bytemuck = { version = "1.14", features = ["derive"], optional = true }
 # the underlying wgpu Device/Queue so our compute shaders share the same GPU context
 # as the egui renderer — no double-init.
 eframe = { version = "0.33", features = ["wgpu"], optional = true }
-image  = { version = "0.25", optional = true }
+image  = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"], optional = true }
 rfd    = { version = "0.15", optional = true }
 
 # ── Build profiles ───────────────────────────────────────────────────────────────

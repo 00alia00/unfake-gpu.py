@@ -128,6 +128,17 @@ pip install -e .
 
 ### Command Line
 
+To run the Rust pipeline directly, without installing the Python package, use
+Cargo. This uses the demo's defaults: 2x dominant downscaling and 16 colors.
+
+```bash
+cargo run --release --features cli --bin unfake-cli -- samples/non_logo.png samples/non_logo_unfaked.png
+```
+
+Cargo builds the executable and its dependencies on the first run and may need
+network access to download crates. Add `--offline` only when the dependencies
+are already cached. The Rust CLI and demo support PNG, JPEG, and WebP images.
+
 ```bash
 # Basic usage with auto-detection
 unfake input.png
